@@ -1,0 +1,10 @@
+jax
+optax
+equinox
+
+tqdm
+
+wandb
+
+tensorflow-cpu
+tensorflow-datasets
