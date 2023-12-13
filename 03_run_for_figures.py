@@ -134,7 +134,7 @@ def train(model, params):
         case 'adam':
             optimizer = optax.adam(params['learning_rate'], params['adam_b1'], params['adam_b2'])
         case 'adagrad':
-            optimizer = optax.adagrad(params['learning_rate'])
+            optimizer = optax.adagrad(params['learning_rate'], initial_accumulator_value=params['initial_value'])
         case 'sgd':
             optimizer = optax.sgd(params['learning_rate'])
         case 'sgdm':
@@ -291,7 +291,7 @@ ash_config = {
     'ash_z_k': Vs([2.2, 2.3, 2.4], manual_value=2.2),
 }
 
-topk_config = {'top_k': Vs([32, 64, 96, 128, 256], manual_value=64)}
+topk_config = {'top_k': Vs([32, 64, 96, 128, 256], manual_value=96)}
 
 activations = {
     'ash': ash_config,
@@ -319,7 +319,8 @@ optimizers = {
         'learning_rate': Vs([8e-6, 1e-5, 1.5e-5], manual_value=1e-5), #logU(4e-6, 6e-6),
     },
     'adagrad' : {
-        'learning_rate': Vs([3e-4, 5e-4, 1e-3], manual_value=1e-5), #logU(4e-6, 6e-6),
+        'learning_rate': Vs([1e-4, 2e-4, 3e-4], manual_value=1e-4), #logU(4e-6, 6e-6),
+        'initial_value': V(1e-6),
     },
     'sgd' : {
         'learning_rate': Vs([3e-4, 4e-4, 5e-4], manual_value=5e-4), #logU(4e-6, 6e-6),
@@ -402,7 +403,7 @@ for chosen_optimizer_config in optimizers_to_run:
         params = sweep_config['parameters']
         print(params)
         if True:
-            run = wandb.init(project='paper figures', entity='skeskinen', config = params)
+            run = wandb.init(project='paper figures', entity='skeskinen', config = params, name=chosen_activation_config)
 
         model = Model(key, params)
         print(f'Model has {sum([np.size(x) for x in jtu.tree_leaves(model)]):,} params')

@@ -7,6 +7,7 @@ import jax.tree_util as jtu
 from jax import random
 import optax
 import equinox as eqx
+from flax.core import FrozenDict
 
 import math
 import numpy as np
@@ -16,6 +17,7 @@ import wandb
 import sys
 
 from collections import deque
+from functools import partial
 
 import tensorflow as tf
 import tensorflow_datasets as tfds
@@ -37,7 +39,7 @@ def mnist_loader(dataset):
     dataset = dataset.map(preprocess_mnist)
     dataset_length = dataset.cardinality().numpy()
     dataset = dataset.shuffle(dataset_length)
-    dataset = dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE).as_numpy_iterator()
+    dataset = dataset.batch(BATCH_SIZE).prefetch(8).as_numpy_iterator()
     return dataset, dataset_length // BATCH_SIZE
 
 def mnist_split_train_loader(split):
@@ -62,6 +64,8 @@ def activation(x, params):
             return topk_subtract(x, params)
         case 'topk_mask':
             return topk_mask(x, params)
+        case 'lwta':
+            return lwta(x, params)
         case 'elephant':
             return elephant(x, params)
         case 'relu':
@@ -72,6 +76,8 @@ def activation(x, params):
             return jax.nn.sigmoid(x)
         case 'hard_sigmoid':
             return jax.nn.hard_sigmoid(x)
+        case 'gumbel':
+            return jnp.exp(-jnp.exp(-x))
 
 def hard_ash(x, params):
     mean = jnp.mean(x)
@@ -92,12 +98,19 @@ def elephant(x, params):
 def topk_subtract(x, params):
     k, _ = jax.lax.top_k(x, params['top_k'])
     v = k[-1]
-    return jax.nn.relu(x - v)
+    # return jax.nn.relu(x - v)
+    return jnp.clip(x - v, 0., 2.)
 
 def topk_mask(x, params):
     k, _ = jax.lax.top_k(x, params['top_k'])
     v = k[-1]
     return jnp.where(x >= v, x, jnp.zeros_like(x))
+
+def lwta(x, params):
+    x = jnp.reshape(x, (params['lwta_g'], -1))
+    max = jnp.argmax(x, axis = -1)
+    mask = jax.nn.one_hot(max, x.shape[-1])
+    return jnp.reshape(mask * x, (-1))
 
 def weight_norm(w, z, norm):
     if norm == False:
@@ -134,13 +147,14 @@ def train(model, params):
         case 'adam':
             optimizer = optax.adam(params['learning_rate'], params['adam_b1'], params['adam_b2'])
         case 'adagrad':
-            optimizer = optax.adagrad(params['learning_rate'])
+            optimizer = optax.adagrad(params['learning_rate'], initial_accumulator_value=params['initial_value'])
         case 'sgd':
-            optimizer = optax.sgd(params['learning_rate'])
+                optimizer = optax.sgd(params['learning_rate'])
         case 'sgdm':
             optimizer = optax.sgd(params['learning_rate'], momentum=params['sgdm_momentum'])
     
-    @eqx.filter_jit
+    # @eqx.filter_jit
+    @partial(jax.jit, static_argnums=1)
     def step_classifier(model, params, opt_state, xs, ys):
         def classifier_loss(model, params, xs, ys):
             def go(x):
@@ -162,7 +176,8 @@ def train(model, params):
     def evaluation(model, params):
         num_classes = 10
 
-        @eqx.filter_jit
+        # @eqx.filter_jit
+        @partial(jax.jit, static_argnums=1)
         def evaluate_step(model, params, xs, ys):
             def go(x):
                 logits = model(x, params)
@@ -186,7 +201,7 @@ def train(model, params):
         correct_counts = jnp.zeros(num_classes)
         total_counts = jnp.zeros(num_classes)
 
-        for xs, ys in tqdm(test_loader, total = loader_length):
+        for xs, ys in test_loader:
             correct, total = evaluate_step(model, params, xs, ys)
             correct_counts += correct
             total_counts += total
@@ -221,6 +236,7 @@ def train(model, params):
                 'task_4_accuracy': per_task_accuracy[4].item(),
             })
 
+    jax.clear_backends()
     return accuracy
 
 
@@ -279,18 +295,20 @@ def lr_scale(x):
 
 # Config and run
 if len(sys.argv) <= 2:
-    print('run.py activation optimizer/all sweep:t/f')
+    print('run.py activation/all optimizer/all sweep:t/f')
     exit(1)
 is_sweep = sys.argv[3] in ['t', 'true', 'sweep'] if len(sys.argv) >= 4 else False
 
 # Configs
 
 ash_config = {
-    'ash_alpha': Vs([3., 4.], manual_value=3.),
+    'ash_alpha': V(3.),
+    # 'ash_alpha': Vs([3., 4.], manual_value=3.), # paper
     'ash_z_k': Vs([2.2, 2.3, 2.4], manual_value=2.3),
 }
 
-topk_config = {'top_k': Vs([32, 64, 96, 128, 256])}
+# topk_config = {'top_k': Vs([32, 64, 96, 128, 256])} # paper
+topk_config = {'top_k': Vs([64, 96])} # paper
 
 activations = {
     'ash': ash_config,
@@ -301,24 +319,32 @@ activations = {
     },
     'topk_subtract': topk_config,
     'topk_mask': topk_config,
+    'lwta': {
+        'lwta_g': Vs([25,50,100])
+    },
     'relu': {},
     'swish': {},
     'sigmoid': {},
     'hard_sigmoid': {},
+    'gumbel': {},
 }
 
 optimizers = {
     'rmsprop' : {
-        'rmsprop_decay': Vs([0.998, 0.999, 0.9991, 0.9992, 0.9993], manual_value=0.9993),
+        # 'rmsprop_decay': Vs([0.9991, 0.9992, 0.9993], manual_value=0.9993),
+        # 'learning_rate': Vs([2e-6, 3e-6, 4e-6], manual_value=5.5e-6), #logU(4e-6, 6e-6),
+        # paper
+        'rmsprop_decay': Vs([0.999, 0.9991, 0.9992, 0.9993], manual_value=0.9993),
         'learning_rate': Vs([4e-6, 5e-6, 5.5e-6, 6e-6, 8e-6], manual_value=5.5e-6), #logU(4e-6, 6e-6),
     },
     'adam' : {
-        'adam_b1': Vs([0.9, 0.95, 0.98, 0.99], manual_value=0.98),
+        'adam_b1': Vs([0.95, 0.98, 0.99], manual_value=0.98),
         'adam_b2': Vs([0.999, 0.9995], manual_value=0.9995),
         'learning_rate': Vs([8e-6, 1e-5, 1.5e-5], manual_value=1e-5), #logU(4e-6, 6e-6),
     },
     'adagrad' : {
-        'learning_rate': Vs([3e-4, 5e-4, 1e-3], manual_value=1e-5), #logU(4e-6, 6e-6),
+        'learning_rate': Vs([1e-4, 2e-4, 3e-4], manual_value=2e-4), #logU(4e-6, 6e-6),
+        'initial_value': V(1e-6),
     },
     'sgd' : {
         'learning_rate': Vs([3e-4, 4e-4, 5e-4], manual_value=4e-4), #logU(4e-6, 6e-6),
@@ -329,7 +355,11 @@ optimizers = {
     },
 }
 
-chosen_activation_config = sys.argv[1]
+if sys.argv[1].startswith('all'):
+    activations_to_run = activations.keys()
+else:
+    activations_to_run = [sys.argv[1]]
+
 if sys.argv[2].startswith('all'):
     optimizers_to_run = optimizers.keys()
     split = sys.argv[2].split('-')
@@ -339,68 +369,71 @@ if sys.argv[2].startswith('all'):
 else:
     optimizers_to_run = [sys.argv[2]]
 
-for chosen_optimizer_config in optimizers_to_run:
+for chosen_activation_config in activations_to_run:
+    for chosen_optimizer_config in optimizers_to_run:
 
-    sweep_config = {
-        'method': 'grid',
-        'name': f'{chosen_activation_config} : {chosen_optimizer_config}',
-        'metric': {
-        'name': 'accuracy_mean',
-        'goal': 'maximize'
-        },
+        sweep_config = {
+            'method': 'grid',
+            'name': f'{chosen_activation_config} : {chosen_optimizer_config}',
+            'metric': {
+            'name': 'accuracy_mean',
+            'goal': 'maximize'
+            },
 
-        'parameters': {
-            'weight_norm': V(1),
-            'grad_clip': V(0.01),
+            'parameters': {
+                'weight_norm': V(1),
+                'grad_clip': V(0.01),
 
-            'layer_size': V(1_000),
-            'layer_count': V(1),
+                'layer_size': V(1000),
+                'layer_count': V(1),
+            }
         }
-    }
-    sweep_config['parameters']['activation'] = V(chosen_activation_config)
-    sweep_config['parameters'].update(activations[chosen_activation_config])
+        sweep_config['parameters']['activation'] = V(chosen_activation_config)
+        sweep_config['parameters'].update(activations[chosen_activation_config])
 
-    sweep_config['parameters']['optimizer'] = V(chosen_optimizer_config)
-    sweep_config['parameters'].update(optimizers[chosen_optimizer_config])
+        sweep_config['parameters']['optimizer'] = V(chosen_optimizer_config)
+        sweep_config['parameters'].update(optimizers[chosen_optimizer_config])
 
-    key = random.PRNGKey(5678)
+        key = random.PRNGKey(5678)
 
-    NUM_RUNS = 5
+        NUM_RUNS = 5
 
-    def run_train(params):
-        accuracies = []
-        for i in tqdm(range(NUM_RUNS)):
-            seed = i + 12345
-            key = random.PRNGKey(seed)
-            tf.random.set_seed(seed)
+        def run_train(params):
+            accuracies = []
+            for i in tqdm(range(NUM_RUNS)):
+                seed = i + 12345
+                key = random.PRNGKey(seed)
+                tf.random.set_seed(seed)
+                params = FrozenDict(params)
+                model = Model(key, params)
+                accuracies.append(train(model, params))
+                std = np.std(accuracies)
+                err = std / np.sqrt(len(accuracies))
+                log({
+                    'accuracy_mean': np.mean(accuracies),
+                    'accuracy_error_bound': err * 1.96
+                })
+                if i > 0 and np.mean(accuracies) < 0.65:
+                    break
+
+        # Function to be called by wandb sweep agent
+        def sweep_train():
+            with wandb.init() as run:
+                jax.clear_caches()
+                params = wandb.config
+                run_train(params)
+
+        if is_sweep:
+            sweep_id = wandb.sweep(sweep_config, project='mnist paper final', entity="skeskinen")
+            wandb.agent(sweep_id, sweep_train)
+        else:
+            params = sweep_config['parameters']
+            print(params)
+            if False:
+                run = wandb.init(project='mnist-norm', entity='skeskinen', config = params)
+
             model = Model(key, params)
-            accuracies.append(train(model, params))
-            std = np.std(accuracies)
-            err = std / np.sqrt(len(accuracies))
-            log({
-                'accuracy_mean': np.mean(accuracies),
-                'accuracy_error_bound': err * 1.96
-            })
-            if i > 0 and np.mean(accuracies) < 0.65:
-                break
+            print(f'Model has {sum([np.size(x) for x in jtu.tree_leaves(model)]):,} params')
 
-    # Function to be called by wandb sweep agent
-    def sweep_train():
-        with wandb.init() as run:
-            params = wandb.config
             run_train(params)
-
-    if is_sweep:
-        sweep_id = wandb.sweep(sweep_config, project='mnist paper final', entity="skeskinen")
-        wandb.agent(sweep_id, sweep_train)
-    else:
-        params = sweep_config['parameters']
-        print(params)
-        if False:
-            run = wandb.init(project='mnist-norm', entity='skeskinen', config = params)
-
-        model = Model(key, params)
-        print(f'Model has {sum([np.size(x) for x in jtu.tree_leaves(model)]):,} params')
-
-        run_train(params)
-        
+            
